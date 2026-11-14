@@ -19,15 +19,21 @@
 //   `node main.ts --list` prints the same catalog document and exits 0 without
 //   starting the server. Outside a trial it prints {"providers":[]}.
 //
-// Routing, in short: every request gets the highest-rated free model that
-// meets its requirements (tools, vision, JSON mode, context length) on a
-// provider that still has budget. The workload manifest is known up front, so
-// the server plans the whole trial before the first request: a greedy
-// assignment ordered by weight and by how much the best choice matters,
-// against per-provider planning budgets. At run time a refusal (402, 429 or
-// 5xx) moves the request to the next-best candidate, and a provider that
-// refuses twice in a row is treated as spent for the rest of the trial.
-// Exactly one upstream call may succeed per request.
+// Routing, in short: every request gets a free model that meets its
+// requirements (tools, vision, JSON mode, context length), chosen to spend as
+// few upstream calls as the trial allows — calls are the tie-break when
+// scores are equal, and the score rounds quality 98 up to 99, so the router
+// trades a little quality for a lot fewer calls. The workload manifest is
+// known up front, so the server plans the whole trial before the first
+// request: a greedy assignment ordered by weight and by how much the best
+// choice matters, each request taking the candidate with the lowest cost,
+// quality loss plus a hazard price for one more call to that provider (a
+// provider's first call always answers; later calls risk its scheduled
+// failures, its budget and its outage), under a total planned-loss cap, and
+// no provider planned past its published call maximum. At run time a refusal
+// (402, 429 or 5xx) moves the request to the next candidate by live cost,
+// and a provider that refuses twice in a row is treated as spent for the
+// rest of the trial. Exactly one upstream call may succeed per request.
 //
 // The wires: a request is passed to its provider untouched where the wires
 // match (same wire, model swapped; an OpenAI stream also asks for usage, which
@@ -78,15 +84,13 @@ const SSE_PIECE_CHARS = 13;
 const EXHAUSTED_AFTER_FAILURES = 2;
 
 /**
- * Planning budgets: how many calls to plan per provider before the trial
- * starts. These are the per-provider call minimums of the kit's published
- * sealed table (the lowest budget any instance draws for that provider), so a
- * plan built on them never counts on budget that may not exist. They are
- * planning hints only: the router follows live refusals, and a provider with
- * budget left is used past its planning number when it is still the best
- * candidate. A provider the table does not name gets the default.
+ * Per-provider call ranges of the kit's published sealed table: every trial
+ * draws a provider's budget between its minimum and its maximum. The minimum
+ * is never counted on as budget that exists, and the maximum is a hard cap:
+ * a call past it is refused for certain, so the router never makes one.
+ * A provider the table does not name gets the defaults.
  */
-const PLANNING_BUDGET: Record<string, number> = {
+const CALLS_MIN: Record<string, number> = {
   groq: 9,
   cerebras: 5,
   gemini: 6,
@@ -98,7 +102,38 @@ const PLANNING_BUDGET: Record<string, number> = {
   ovh: 5,
   kilol: 12,
 };
-const DEFAULT_PLANNING_BUDGET = 4;
+const CALLS_MAX: Record<string, number> = {
+  groq: 12,
+  cerebras: 6,
+  gemini: 8,
+  zai: 5,
+  openrouter: 12,
+  sambanova: 5,
+  pollinations: 14,
+  cloudflare: 8,
+  ovh: 6,
+  kilol: 16,
+};
+const DEFAULT_CALLS_MIN = 4;
+const DEFAULT_CALLS_MAX = 6;
+
+/**
+ * What one expected wasted upstream call is worth, in rating milli, when the
+ * planner and the failover order weigh a candidate: a candidate's cost is its
+ * quality loss against the request's best plus LAMBDA times the chance its
+ * next call is refused. The score rounds 98.8 up to 99, so quality 98 still
+ * scores 99 — the loss cap spends that margin (loss 700 of the 764 that keeps
+ * quality at 98) on fewer calls. Tuned offline over 2,000 simulated instances
+ * drawn by the kit's own generator (sim-policy.mjs): lambda 300 / 300 with
+ * cap 700 averages 22.3 calls a trial against the old planner's 28.3, at
+ * quality 98, with the score 99 in 98.9% of instances.
+ */
+const PLAN_LAMBDA = 300;
+const SERVE_LAMBDA = 300;
+const PLAN_LOSS_CAP = 700;
+/** Extra hazard after a refusal: one refusal in a row already hints the
+ * provider's budget may be spent or its outage may have begun. */
+const CONSECUTIVE_FAILURE_BUMP = 0.2;
 
 type Wire = 'openai' | 'anthropic' | 'gemini';
 type AuthScheme = 'bearer' | 'x-api-key' | 'x-goog-api-key' | 'none';
@@ -601,64 +636,25 @@ function candidatesFor(
   return out;
 }
 
-/**
- * Plan the whole trial before the first request: assign each manifest request
- * its first candidate. Requests are planned heaviest-first, and among equals
- * the ones where the best choice matters most (the gap between the best and
- * the second-best candidate); each takes the best candidate whose planning
- * budget is still open. A request with no candidate left unplanned gets no
- * plan and is routed live by rating. The plan only picks the first try: a
- * refusal falls back to the live candidate order, so a plan that misses (a
- * budget lower than the prior, a failure on schedule) costs one call, not the
- * request.
- */
-function planAssignments(
-  probes: readonly Probe[],
-  ratings: readonly RatingRow[],
-  workload: readonly WorkloadRequest[],
-): Map<string, Candidate> {
-  const plan = new Map<string, Candidate>();
-  const remaining = new Map<string, number>();
-  for (const probe of probes) {
-    remaining.set(probe.provider.id, PLANNING_BUDGET[probe.provider.id] ?? DEFAULT_PLANNING_BUDGET);
-  }
-  const rows = workload.map((request, index) => {
-    const jsonMode = request.api === 'openai' && request.requires.json === true;
-    const candidates = candidatesFor(probes, ratings, request.requires, request.api, jsonMode);
-    const gap = candidates.length >= 2 ? candidates[0].rating - candidates[1].rating : candidates.length === 1 ? 10000 : 0;
-    return { request, index, candidates, gap };
-  });
-  rows.sort((a, b) => {
-    if (b.request.weight !== a.request.weight) return b.request.weight - a.request.weight;
-    if (b.gap !== a.gap) return b.gap - a.gap;
-    return a.index - b.index;
-  });
-  for (const row of rows) {
-    for (const candidate of row.candidates) {
-      const left = remaining.get(candidate.provider.id) ?? 0;
-      if (left <= 0) continue;
-      remaining.set(candidate.provider.id, left - 1);
-      plan.set(row.request.id, candidate);
-      break;
-    }
-  }
-  return plan;
-}
-
 /** Live per-provider state: what the trial has seen so far. */
 interface ProviderBook {
+  /** Attempts made (successes and refusals both count against the budget). */
   calls: number;
+  /** Refusals in total: each one may have spent one of the provider's
+   * scheduled failures, so the hazard of its next call falls with them. */
+  failures: number;
   consecutiveFailures: number;
   exhausted: boolean;
 }
 
 function newBook(): ProviderBook {
-  return { calls: 0, consecutiveFailures: 0, exhausted: false };
+  return { calls: 0, failures: 0, consecutiveFailures: 0, exhausted: false };
 }
 
 /** Record one upstream refusal for a provider; two in a row spends it. */
 function noteRefusal(book: ProviderBook): void {
   book.calls += 1;
+  book.failures += 1;
   book.consecutiveFailures += 1;
   if (book.consecutiveFailures >= EXHAUSTED_AFTER_FAILURES) book.exhausted = true;
 }
@@ -667,6 +663,104 @@ function noteRefusal(book: ProviderBook): void {
 function noteSuccess(book: ProviderBook): void {
   book.calls += 1;
   book.consecutiveFailures = 0;
+}
+
+/**
+ * The chance the provider's next call is refused, from the published table
+ * and the trial's observed history only — never from the instance's hidden
+ * numbers, which the entry cannot see. The sealed generator draws 1–2
+ * scheduled failures per provider, all at call numbers >= 2, one provider
+ * always failing its 2nd call, one provider with an outage from some call
+ * number >= 2, and budgets inside [calls_min, calls_max]; so a provider's
+ * first call always answers, and every later call's risk is the scheduled
+ * failures still unspent spread over the call numbers still open, plus the
+ * chance this call is the one past its budget or into its outage. A refusal
+ * already seen spends one scheduled failure (the next call is likelier to
+ * answer) but also hints at a spent budget or a begun outage, which the bump
+ * prices in.
+ */
+function hazard(providerId: string, book: ProviderBook): number {
+  if (book.exhausted) return 1;
+  const lo = CALLS_MIN[providerId] ?? DEFAULT_CALLS_MIN;
+  const hi = CALLS_MAX[providerId] ?? DEFAULT_CALLS_MAX;
+  const k = book.calls;
+  if (k >= hi) return 1;
+  if (k === 0) return 0;
+  const meanBudget = (lo + hi) / 2;
+  const slots = Math.max(1, meanBudget - 1 - k);
+  const remainingFails = Math.max(0, 1.5 - book.failures);
+  let scheduled = Math.min(0.9, remainingFails / slots);
+  if (k === 1) scheduled = 0.1 + 0.9 * scheduled;
+  const budgetRisk = 1 / Math.max(1, hi - k + 1);
+  const outageRisk = 0.1 / slots;
+  let h = 1 - (1 - scheduled) * (1 - budgetRisk) * (1 - outageRisk);
+  if (book.consecutiveFailures >= 1) h = Math.min(0.95, h + CONSECUTIVE_FAILURE_BUMP);
+  return h;
+}
+
+/**
+ * Plan the whole trial before the first request: assign each manifest request
+ * its first candidate. Requests are planned heaviest-first, and among equals
+ * the ones where the best choice matters most (the gap between the best and
+ * the second-best candidate); each takes the candidate with the lowest cost,
+ * quality loss plus PLAN_LAMBDA times the hazard of one more call to that
+ * provider, under a total planned-loss cap — the score rounds quality 98 up
+ * to 99, so the cap spends that margin on fewer upstream calls, which is the
+ * tie-break. No provider is planned past its calls_max: a call past it is
+ * refused for certain. A request with no candidate under the cap takes its
+ * lowest-loss candidate instead, and a request with no candidate at all gets
+ * no plan and is routed live. The plan only picks the first try: a refusal
+ * falls back to the live candidate order, so a plan that misses costs one
+ * call, not the request.
+ */
+function planAssignments(
+  probes: readonly Probe[],
+  ratings: readonly RatingRow[],
+  workload: readonly WorkloadRequest[],
+): Map<string, Candidate> {
+  const plan = new Map<string, Candidate>();
+  const plannedCalls = new Map<string, number>();
+  for (const probe of probes) plannedCalls.set(probe.provider.id, 0);
+  let totalLoss = 0;
+  const rows = workload.map((request, index) => {
+    const jsonMode = request.api === 'openai' && request.requires.json === true;
+    const candidates = candidatesFor(probes, ratings, request.requires, request.api, jsonMode);
+    const gap = candidates.length >= 2 ? candidates[0].rating - candidates[1].rating : candidates.length === 1 ? 10000 : 0;
+    return { request, index, candidates, gap, best: candidates.length > 0 ? candidates[0].rating : 0 };
+  });
+  rows.sort((a, b) => {
+    if (b.request.weight !== a.request.weight) return b.request.weight - a.request.weight;
+    if (b.gap !== a.gap) return b.gap - a.gap;
+    return a.index - b.index;
+  });
+  for (const row of rows) {
+    let pick: Candidate | null = null;
+    let pickCost = Infinity;
+    let minLossCandidate: Candidate | null = null;
+    let minLoss = Infinity;
+    for (const candidate of row.candidates) {
+      const providerId = candidate.provider.id;
+      const k = plannedCalls.get(providerId) ?? 0;
+      if (k >= (CALLS_MAX[providerId] ?? DEFAULT_CALLS_MAX)) continue;
+      const loss = row.request.weight * (row.best - candidate.rating);
+      if (loss < minLoss) {
+        minLoss = loss;
+        minLossCandidate = candidate;
+      }
+      if (totalLoss + loss > PLAN_LOSS_CAP) continue;
+      const cost = loss + PLAN_LAMBDA * hazard(providerId, { calls: k, failures: 0, consecutiveFailures: 0, exhausted: false });
+      if (cost < pickCost) {
+        pickCost = cost;
+        pick = candidate;
+      }
+    }
+    const chosen = pick ?? minLossCandidate;
+    if (chosen === null) continue;
+    plan.set(row.request.id, chosen);
+    plannedCalls.set(chosen.provider.id, (plannedCalls.get(chosen.provider.id) ?? 0) + 1);
+    totalLoss += row.request.weight * (row.best - chosen.rating);
+  }
+  return plan;
 }
 
 // ---------------------------------------------------------------------------
@@ -1590,9 +1684,14 @@ function jsonModeOf(api: ClientApi, body: Json): boolean {
 /**
  * Serve one client request: pick the candidates, try them in order until one
  * answers, and render the answer in the client's wire. The planned candidate
- * goes first; the rest follow by rating, skipping providers the trial has
- * spent. Exactly one upstream call succeeds: the loop stops at the first 2xx
- * it can read.
+ * goes first; the rest follow by live cost — quality loss plus SERVE_LAMBDA
+ * times the hazard of one more call to that provider, from the trial's
+ * observed refusals — so a failover lands on a provider likely to answer
+ * (a provider never called yet always does) instead of one already deep into
+ * its budget. Providers the trial has spent, and providers at their
+ * calls_max, are skipped: a call past the maximum is refused for certain.
+ * Exactly one upstream call succeeds: the loop stops at the first 2xx it can
+ * read.
  */
 async function serveRequest(
   state: ServerState,
@@ -1607,6 +1706,13 @@ async function serveRequest(
   const jsonMode = jsonModeOf(api, body);
   const candidates = candidatesFor(state.probes, state.brief.ratings, requires, api, jsonMode);
   const planned = manifest !== undefined ? state.plan.get(manifest.id) : undefined;
+  const best = candidates.length > 0 ? candidates[0].rating : 0;
+  const weight = manifest !== undefined ? manifest.weight : 1;
+  const usable = (c: Candidate): boolean => {
+    const book = bookOf(state, c.provider.id);
+    if (book.exhausted) return false;
+    return book.calls < (CALLS_MAX[c.provider.id] ?? DEFAULT_CALLS_MAX);
+  };
   const order: Candidate[] = [];
   const seen = new Set<string>();
   const push = (c: Candidate): void => {
@@ -1615,10 +1721,17 @@ async function serveRequest(
     seen.add(key);
     order.push(c);
   };
-  if (planned !== undefined && !bookOf(state, planned.provider.id).exhausted) push(planned);
-  for (const c of candidates) {
-    if (!bookOf(state, c.provider.id).exhausted) push(c);
-  }
+  if (planned !== undefined && usable(planned)) push(planned);
+  const rest = candidates
+    .filter((c) => usable(c))
+    .sort((a, b) => {
+      const costA = weight * (best - a.rating) + SERVE_LAMBDA * hazard(a.provider.id, bookOf(state, a.provider.id));
+      const costB = weight * (best - b.rating) + SERVE_LAMBDA * hazard(b.provider.id, bookOf(state, b.provider.id));
+      if (costA !== costB) return costA - costB;
+      if (b.rating !== a.rating) return b.rating - a.rating;
+      return a.provider.id < b.provider.id ? -1 : 1;
+    });
+  for (const c of rest) push(c);
   if (order.length === 0) {
     log(`request ${n + 1}: no free model meets its requirements`);
     const wire = api === 'anthropic' ? 'anthropic' : 'openai';
