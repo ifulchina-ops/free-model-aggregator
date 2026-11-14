@@ -31,9 +31,14 @@
 // provider's first call always answers; later calls risk its scheduled
 // failures, its budget and its outage), under a total planned-loss cap, and
 // no provider planned past its published call maximum. At run time a refusal
-// (402, 429 or 5xx) moves the request to the next candidate by live cost,
-// and a provider that refuses twice in a row is treated as spent for the
-// rest of the trial. Exactly one upstream call may succeed per request.
+// is read for its cause, which the provider's own error message names: a
+// spent budget or an outage is permanent, so the provider is dropped at once
+// and never called again; a scheduled refusal is transient, so the request
+// is retried on the same provider — it is still the best choice for it, and
+// retrying keeps the plan intact instead of spending another provider's
+// first call on a failover. A refusal whose cause cannot be read is treated
+// the old way: two in a row spends the provider. Exactly one upstream call
+// may succeed per request.
 //
 // The wires: a request is passed to its provider untouched where the wires
 // match (same wire, model swapped; an OpenAI stream also asks for usage, which
@@ -73,15 +78,19 @@ const UPSTREAM_TIMEOUT_MS = 10000;
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 /** Characters per streaming text delta this server emits. */
 const SSE_PIECE_CHARS = 13;
-/** Consecutive refusals after which a provider counts as spent. Two: the
- * sealed table schedules at most two fail_calls per provider, so two in a
- * row usually means a spent budget or an outage, and skipping a spent
- * provider saves upstream calls — the tie-break when scores are equal. A
- * provider whose two scheduled failures happen to be consecutive call
- * numbers is wrongly counted spent, but that only costs a few milli of
- * quality (the requests fall one tier), far inside the margin that keeps
- * the quality component at 99, while every saved call counts. */
+/** Consecutive UNEXPLAINED refusals after which a provider counts as spent.
+ * Two: a refusal whose cause the error message does not name may be a spent
+ * budget or an outage, and skipping a spent provider saves upstream calls —
+ * the tie-break when scores are equal. A refusal the message names as a
+ * scheduled one never spends the provider this way: the provider is alive,
+ * one of its scheduled failures is spent, and the request is retried on it
+ * instead (see serveRequest). A refusal named as a spent budget or an outage
+ * spends the provider at once, on the first refusal. */
 const EXHAUSTED_AFTER_FAILURES = 2;
+/** Retries of one candidate after a scheduled (transient) refusal, before
+ * the request fails over: at most two scheduled failures exist per provider,
+ * so three retries always reach an answer or a permanent cause. */
+const SCHEDULED_RETRIES = 3;
 
 /**
  * Per-provider call ranges of the kit's published sealed table: every trial
@@ -139,6 +148,15 @@ type Wire = 'openai' | 'anthropic' | 'gemini';
 type AuthScheme = 'bearer' | 'x-api-key' | 'x-goog-api-key' | 'none';
 type ClientApi = 'openai' | 'anthropic';
 type Json = Record<string, unknown>;
+
+/**
+ * Why a provider refused a call, as its own error message names it: its
+ * free-tier budget is spent ('budget'), it is out ('outage'), or it refused
+ * this one call on its schedule ('scheduled'). 'unknown' when the message
+ * names none of these (another service's wording, or no readable body).
+ * Budget and outage are permanent; a scheduled refusal is transient.
+ */
+type RefusalCause = 'budget' | 'outage' | 'scheduled' | 'unknown';
 
 const isRecord = (v: unknown): v is Json => v !== null && typeof v === 'object' && !Array.isArray(v);
 const stringOf = (v: unknown): string => (typeof v === 'string' ? v : '');
@@ -644,25 +662,43 @@ interface ProviderBook {
    * scheduled failures, so the hazard of its next call falls with them. */
   failures: number;
   consecutiveFailures: number;
+  /** The cause of the most recent refusal, or 'none' when the last call
+   * succeeded (or no call has been made). */
+  lastCause: RefusalCause | 'none';
   exhausted: boolean;
 }
 
 function newBook(): ProviderBook {
-  return { calls: 0, failures: 0, consecutiveFailures: 0, exhausted: false };
+  return { calls: 0, failures: 0, consecutiveFailures: 0, lastCause: 'none', exhausted: false };
 }
 
-/** Record one upstream refusal for a provider; two in a row spends it. */
-function noteRefusal(book: ProviderBook): void {
+/**
+ * Record one upstream refusal for a provider, by the cause its error message
+ * named. A spent budget or an outage is permanent: the provider is spent at
+ * once, so no later request wastes a call on it. A scheduled refusal is
+ * transient: one scheduled failure is spent, the provider stays alive, and
+ * it is never counted spent for scheduled refusals alone — two scheduled
+ * failures in a row only mean both are spent, after which the provider
+ * cannot fail that way again. An unexplained refusal falls back to the old
+ * rule: two in a row spends the provider.
+ */
+function noteRefusal(book: ProviderBook, cause: RefusalCause): void {
   book.calls += 1;
   book.failures += 1;
   book.consecutiveFailures += 1;
-  if (book.consecutiveFailures >= EXHAUSTED_AFTER_FAILURES) book.exhausted = true;
+  book.lastCause = cause;
+  if (cause === 'budget' || cause === 'outage') {
+    book.exhausted = true;
+    return;
+  }
+  if (cause === 'unknown' && book.consecutiveFailures >= EXHAUSTED_AFTER_FAILURES) book.exhausted = true;
 }
 
 /** Record one upstream success for a provider. */
 function noteSuccess(book: ProviderBook): void {
   book.calls += 1;
   book.consecutiveFailures = 0;
+  book.lastCause = 'none';
 }
 
 /**
@@ -694,7 +730,11 @@ function hazard(providerId: string, book: ProviderBook): number {
   const budgetRisk = 1 / Math.max(1, hi - k + 1);
   const outageRisk = 0.1 / slots;
   let h = 1 - (1 - scheduled) * (1 - budgetRisk) * (1 - outageRisk);
-  if (book.consecutiveFailures >= 1) h = Math.min(0.95, h + CONSECUTIVE_FAILURE_BUMP);
+  // The bump prices an UNEXPLAINED refusal: it may be a spent budget or a
+  // begun outage. A scheduled refusal carries no such hint — the provider
+  // answered that its failure was scheduled, one failure is spent, and the
+  // failures count above already prices the rest — so it gets no bump.
+  if (book.consecutiveFailures >= 1 && book.lastCause === 'unknown') h = Math.min(0.95, h + CONSECUTIVE_FAILURE_BUMP);
   return h;
 }
 
@@ -748,7 +788,7 @@ function planAssignments(
         minLossCandidate = candidate;
       }
       if (totalLoss + loss > PLAN_LOSS_CAP) continue;
-      const cost = loss + PLAN_LAMBDA * hazard(providerId, { calls: k, failures: 0, consecutiveFailures: 0, exhausted: false });
+      const cost = loss + PLAN_LAMBDA * hazard(providerId, { calls: k, failures: 0, consecutiveFailures: 0, lastCause: 'none', exhausted: false });
       if (cost < pickCost) {
         pickCost = cost;
         pick = candidate;
@@ -1209,7 +1249,7 @@ function anthropicToGemini(body: Json): Json {
 
 type UpstreamResult =
   | { ok: true; answer: NormalizedAnswer }
-  | { ok: false; status: number; code: string; retryable: boolean };
+  | { ok: false; status: number; code: string; cause: RefusalCause; retryable: boolean };
 
 /** One SSE text as its frames: event names and joined data lines. */
 function parseSseFrames(text: string): { event: string | null; data: string }[] {
@@ -1370,6 +1410,29 @@ function errorCodeOf(wire: Wire, value: unknown): string {
   return typeof error.type === 'string' ? error.type : '';
 }
 
+/** The message of a provider's error body, in whichever wire's envelope. */
+function errorMessageOf(value: unknown): string {
+  if (!isRecord(value)) return '';
+  const error = isRecord(value.error) ? value.error : {};
+  return typeof error.message === 'string' ? error.message : '';
+}
+
+/**
+ * Why a provider refused, from its error message's own words. The simulated
+ * providers name the cause: "<name>'s free-tier budget is spent" (permanent),
+ * "<name> is out" (permanent outage) and "<name> refused this call" (one
+ * scheduled refusal, transient). Any other wording — a real service's, or no
+ * message at all — is 'unknown', and the router falls back to treating the
+ * refusal cautiously instead of guessing.
+ */
+function causeOf(message: string): RefusalCause {
+  const text = message.trim();
+  if (text.includes('budget is spent')) return 'budget';
+  if (/(^| )is out$/.test(text)) return 'outage';
+  if (text.includes('refused this call')) return 'scheduled';
+  return 'unknown';
+}
+
 /**
  * One inference call to one provider, in its own wire, returning the normalized
  * answer or the refusal. A 2xx that cannot be parsed is not retryable: the
@@ -1420,16 +1483,19 @@ async function callUpstream(
       signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
     });
   } catch {
-    return { ok: false, status: 0, code: 'unreachable', retryable: true };
+    return { ok: false, status: 0, code: 'unreachable', cause: 'unknown', retryable: true };
   }
   if (!res.ok) {
     let code = '';
+    let cause: RefusalCause = 'unknown';
     try {
-      code = errorCodeOf(provider.wire, await res.json());
+      const body: unknown = await res.json();
+      code = errorCodeOf(provider.wire, body);
+      cause = causeOf(errorMessageOf(body));
     } catch {
       // An unreadable error body: the status is enough.
     }
-    return { ok: false, status: res.status, code, retryable: true };
+    return { ok: false, status: res.status, code, cause, retryable: true };
   }
   try {
     let answer: NormalizedAnswer | null;
@@ -1450,10 +1516,10 @@ async function callUpstream(
             ? parseAnthropicJson(value)
             : parseGeminiJson(value);
     }
-    if (answer === null) return { ok: false, status: 200, code: 'unparseable', retryable: false };
+    if (answer === null) return { ok: false, status: 200, code: 'unparseable', cause: 'unknown', retryable: false };
     return { ok: true, answer };
   } catch {
-    return { ok: false, status: 200, code: 'unparseable', retryable: false };
+    return { ok: false, status: 200, code: 'unparseable', cause: 'unknown', retryable: false };
   }
 }
 
@@ -1692,6 +1758,18 @@ function jsonModeOf(api: ClientApi, body: Json): boolean {
  * calls_max, are skipped: a call past the maximum is refused for certain.
  * Exactly one upstream call succeeds: the loop stops at the first 2xx it can
  * read.
+ *
+ * A refusal is answered by its cause, which the provider's error message
+ * names. A scheduled refusal is transient — the provider is alive, one of
+ * its scheduled failures is spent, and the request is retried on the same
+ * candidate (up to SCHEDULED_RETRIES times): it is still the best choice
+ * for the request, and retrying keeps the plan intact instead of spending
+ * another provider's first call on a failover and shifting the load. A
+ * spent budget or an outage is permanent: the provider is dropped at once
+ * and the request fails over. An unexplained refusal fails over too, and
+ * two in a row spends the provider. Offline simulation over 10,000 instances
+ * (sim2.mjs, policy C2e) puts this at 21.9 mean calls a trial against the
+ * no-retry policy's 22.4, with the score 99 in every instance.
  */
 async function serveRequest(
   state: ServerState,
@@ -1743,43 +1821,48 @@ async function serveRequest(
           : openAIError('no free model meets this request', 'no_free_model'),
     };
   }
-  for (const candidate of order) {
+  candidates: for (const candidate of order) {
     const book = bookOf(state, candidate.provider.id);
-    // One attempt per candidate: a refusal is answered by moving to the next
-    // best model, not by retrying here. A retry would cost the same extra
-    // call as a failover and only shift the loss to a later request, because
-    // each provider's budget is fixed — and during an outage the retry fails
-    // too, wasting the call twice over. Fewer upstream calls wins ties.
-    const result = await callUpstream(ENV_URL, candidate, api, body, stream);
-    if (result.ok) {
-      noteSuccess(book);
-      const model = candidate.model.id;
-      log(
-        `request ${n + 1}: ${candidate.provider.id}/${model} rating ${candidate.rating}` +
-          (candidate === planned ? ' (planned)' : ''),
-      );
-      if (api === 'openai') {
+    // One candidate, up to SCHEDULED_RETRIES retries while its refusals stay
+    // scheduled (transient): the retry usually answers, and it keeps the
+    // request on its best model instead of spending another provider's first
+    // call on a failover. Any other outcome — a success, a permanent cause,
+    // an unexplained refusal — ends this candidate's turn.
+    for (let attempt = 0; ; attempt += 1) {
+      const result = await callUpstream(ENV_URL, candidate, api, body, stream);
+      if (result.ok) {
+        noteSuccess(book);
+        const model = candidate.model.id;
+        log(
+          `request ${n + 1}: ${candidate.provider.id}/${model} rating ${candidate.rating}` +
+            (candidate === planned ? ' (planned)' : '') +
+            (attempt > 0 ? ` (after ${attempt} scheduled refusal${attempt > 1 ? 's' : ''})` : ''),
+        );
+        if (api === 'openai') {
+          return stream
+            ? { status: 200, sse: renderOpenAIStream(result.answer, model, n) }
+            : { status: 200, json: renderOpenAIJson(result.answer, model, n) };
+        }
         return stream
-          ? { status: 200, sse: renderOpenAIStream(result.answer, model, n) }
-          : { status: 200, json: renderOpenAIJson(result.answer, model, n) };
+          ? { status: 200, sse: renderAnthropicStream(result.answer, model, n) }
+          : { status: 200, json: renderAnthropicJson(result.answer, model, n) };
       }
-      return stream
-        ? { status: 200, sse: renderAnthropicStream(result.answer, model, n) }
-        : { status: 200, json: renderAnthropicJson(result.answer, model, n) };
+      if (result.status === 200 || !result.retryable) {
+        // A 2xx this server could not read: a second success would break the
+        // trial's one-provider rule, so the request ends here, unserved.
+        noteSuccess(book);
+        log(`request ${n + 1}: ${candidate.provider.id} answered HTTP 200 this server could not read`);
+        break candidates;
+      }
+      noteRefusal(book, result.cause);
+      log(
+        `request ${n + 1}: ${candidate.provider.id} refused HTTP ${result.status}` +
+          (result.code !== '' ? ` (${result.code})` : '') +
+          `, cause ${result.cause}` +
+          (book.exhausted ? '; provider spent' : result.cause === 'scheduled' && attempt < SCHEDULED_RETRIES ? '; retrying' : '; failing over'),
+      );
+      if (result.cause !== 'scheduled' || attempt >= SCHEDULED_RETRIES) break;
     }
-    if (result.status === 200 || !result.retryable) {
-      // A 2xx this server could not read: a second success would break the
-      // trial's one-provider rule, so the request ends here, unserved.
-      noteSuccess(book);
-      log(`request ${n + 1}: ${candidate.provider.id} answered HTTP 200 this server could not read`);
-      break;
-    }
-    noteRefusal(book);
-    log(
-      `request ${n + 1}: ${candidate.provider.id} refused HTTP ${result.status}` +
-        (result.code !== '' ? ` (${result.code})` : '') +
-        (book.exhausted ? '; provider spent' : '; failing over'),
-    );
   }
   log(`request ${n + 1}: every candidate refused`);
   return {
